@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,20 +26,20 @@ import (
 )
 
 type secret struct {
-	Name            string     `json:"name"`
-	Key             string     `json:"key"`
-	Path            string     `json:"path"`
-	Owner           string     `json:"owner"`
-	Group           string     `json:"group"`
-	SopsFile        string     `json:"sopsFile"`
-	Format          FormatType `json:"format"`
-	Mode            string     `json:"mode"`
-	RestartServices []string   `json:"restartServices"`
-	ReloadServices  []string   `json:"reloadServices"`
-	value           []byte
-	mode            os.FileMode
-	owner           int
-	group           int
+	Name         string     `json:"name"`
+	Key          string     `json:"key"`
+	Path         string     `json:"path"`
+	Owner        string     `json:"owner"`
+	Group        string     `json:"group"`
+	SopsFile     string     `json:"sopsFile"`
+	Format       FormatType `json:"format"`
+	Mode         string     `json:"mode"`
+	RestartUnits []string   `json:"restartUnits"`
+	ReloadUnits  []string   `json:"reloadUnits"`
+	value        []byte
+	mode         os.FileMode
+	owner        int
+	group        int
 }
 
 type manifest struct {
@@ -509,6 +510,74 @@ func importSSHKeys(keyPaths []string, gpgHome string) error {
 	return nil
 }
 
+func handleRestart(symlinkPath string, secretDir string, secrets []secret) error {
+	var restart []string
+	var reload []string
+
+	// When /run/booted-system does not exist yet, we are being run in stage-2-init.sh
+	// where switch-to-configuration is not run so the services would only be restarted
+	// the next time switch-to-configuration is run.
+	if _, err := os.Stat("/run/booted-system"); os.IsNotExist(err) {
+		return nil
+	}
+	for _, secret := range secrets {
+		// Skip when there are no restarts/reloads
+		if len(secret.RestartUnits) == 0 && len(secret.ReloadUnits) == 0 {
+			continue
+		}
+		oldPath := filepath.Join(symlinkPath, secret.Name)
+		newPath := filepath.Join(secretDir, secret.Name)
+
+		// Read the old file
+		oldData, err := ioutil.ReadFile(oldPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// File did not exist before
+				restart = append(restart, secret.RestartUnits...)
+				reload = append(reload, secret.ReloadUnits...)
+				continue
+			}
+			return err
+		}
+
+		// Read the new file
+		newData, err := ioutil.ReadFile(newPath)
+		if err != nil {
+			return err
+		}
+
+		if !bytes.Equal(oldData, newData) {
+			restart = append(restart, secret.RestartUnits...)
+			reload = append(reload, secret.ReloadUnits...)
+		}
+	}
+
+	// Write the services to restart/reload
+	writeLines := func(list []string, file string) error {
+		if len(list) != 0 {
+			f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			for _, unit := range list {
+				if _, err = f.WriteString(unit + "\n"); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := writeLines(restart, "/run/systemd/restart-list"); err != nil {
+		return err
+	}
+	if err := writeLines(reload, "/run/systemd/reload-list"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 type keyring struct {
 	path string
 }
@@ -616,6 +685,9 @@ func installSecrets(args []string) error {
 	}
 	if err := writeSecrets(*secretDir, manifest.Secrets); err != nil {
 		return fmt.Errorf("Cannot write secrets: %w", err)
+	}
+	if err := handleRestart(manifest.SymlinkPath, *secretDir, manifest.Secrets); err != nil {
+		return fmt.Errorf("Cannot request units to restart/reload: %w", err)
 	}
 	if err := symlinkSecrets(manifest.SymlinkPath, manifest.Secrets); err != nil {
 		return fmt.Errorf("Failed to prepare symlinks to secret store: %w", err)
